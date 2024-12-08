@@ -45,7 +45,7 @@ class EarlyStopping:
                 print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
             if self.counter >= self.patience:
                 self.early_stop = True
-                model.load_model(self.model_file)
+                model.load_checkpoints(self.model_file)
         else:
             self.best_score = score
             self.save_checkpoint(loss, model)
@@ -128,13 +128,15 @@ class nb_loss(nn.Module):
         """
         super(nb_loss, self).__init__()
 
-    def forward(self, x, mean, disp):
+    def forward(self, x, mean, disp, scale_factor):
+        scale_factor = scale_factor[:, None]
+        mean = mean * scale_factor
         n_log_nb = torch.lgamma(disp+eps) + torch.lgamma(x+1.0) - torch.lgamma(x+disp+eps) + \
             (disp+x) * torch.log(1.0 + (mean/(disp+eps))) + x * (torch.log(disp+eps) - torch.log(mean+eps))
         return torch.sum(n_log_nb)
     
 
-def gauss_cross_entropy(mu1, var1, mu2, var2):
+def gauss_cross_entropy(mu1, var1, mu2, var2, device):
     """
     multi-variate:
     H(p) = d/2*(1+log(2*pi)) + 0.5*log(|var1|)
@@ -143,7 +145,7 @@ def gauss_cross_entropy(mu1, var1, mu2, var2):
     H = 0.5 * log(2*pi) + 0.5 * log(var) + 0.5
     KL = log(var2/var1) + (var1 + (mu1-mu2)**2/var2)*0.5 - 0.5
     """
-    return (-0.5 * (torch.log(2*torch.tensor([torch.pi])) + torch.log(var2) + (var1 + mu1 ** 2 - 2 * mu1 * mu2 + mu2 ** 2) / var2))
+    return (-0.5 * (torch.log(2*torch.tensor([torch.pi], device=device)) + torch.log(var2) + (var1 + mu1 ** 2 - 2 * mu1 * mu2 + mu2 ** 2) / var2))
 
 
 class exp_trans(nn.Module):

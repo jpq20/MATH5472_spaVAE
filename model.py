@@ -14,7 +14,7 @@ from utils import *
 class encoder(nn.Module):
     def __init__(self, input_dim, hidden_dims, output_dim, activation="relu", dropout=0, dtype=torch.float32, norm="batchnorm"):
         super(encoder, self).__init__()
-        self.layers = buildNetwork([input_dim]+hidden_dims, network="decoder", activation=activation, dropout=dropout, dtype=dtype, norm=norm)
+        self.layers = buildNetwork([input_dim]+hidden_dims, activation=activation, dropout=dropout, dtype=dtype, norm=norm)
         self.enc_mu = nn.Linear(hidden_dims[-1], output_dim)
         self.enc_var = nn.Linear(hidden_dims[-1], output_dim)
 
@@ -39,8 +39,8 @@ class spaVAE(nn.Module):
                  input_dim, latent_GP_dim, latent_Gau_dim, encoder_dims, decoder_dims,
                  encoder_dropout, decoder_dropout,
                  initial_inducing_points, 
-                 inital_kernel_scale, 
-                 tuning_beta_flag, desired_KL_loss, init_beta, min_beta, max_beta,
+                 initial_kernel_scale, 
+                 desired_KL_loss, init_beta, min_beta, max_beta,
                  N_train
                  ):
         super(spaVAE, self).__init__()
@@ -56,9 +56,8 @@ class spaVAE(nn.Module):
         self.encoder_dims = encoder_dims
         self.decoder_dims = decoder_dims
 
-        self.kernel_scale = inital_kernel_scale
+        self.kernel_scale = initial_kernel_scale
 
-        self.tuning_beta_flag = tuning_beta_flag
         self.desired_KL_loss = desired_KL_loss
         self.beta = init_beta
         self.PID = pid(Kp=0.01, Ki=-0.005, init_beta=init_beta, min_beta=min_beta, max_beta=max_beta)
@@ -68,13 +67,13 @@ class spaVAE(nn.Module):
         self.recon_mean = nn.Sequential(nn.Linear(decoder_dims[-1], input_dim), MeanAct())
         self.recon_covariance = nn.Parameter(torch.randn(self.input_dim), requires_grad=True)
 
-        self.nbloss = nb_loss()
+        self.nbloss = nb_loss().to(self.device)
 
         self.N_train = N_train
         self.jitter = 1e-8
 
         self.inducing_index_points = torch.tensor(initial_inducing_points, dtype=dtype).to(device)
-        self.kernel = cauchy_kernel(scale=inital_kernel_scale, device=device, dtype=dtype)
+        self.kernel = cauchy_kernel(scale=initial_kernel_scale, device=device, dtype=dtype)
 
         self.to(self.device)
 
@@ -88,7 +87,7 @@ class spaVAE(nn.Module):
         model_dict.update(pretrained_dict) 
         self.load_state_dict(model_dict)
 
-    def cal_L_H(self,x,y,noise,mu_hat,A_hat):
+    def cal_L_H(self, x, y, noise, mu_hat,A_hat):
         """
         compute L_H for the data in the current batch
         """
@@ -144,20 +143,20 @@ class spaVAE(nn.Module):
         K_xp = self.kernel(index_points, self.inducing_index_points) # (x,p)
         K_px = torch.transpose(K_xp, 0, 1) # (p,x)
 
-        K_nm = self.kernel(index_points, self.inducing_index_points) # (N,p)
-        K_mn = torch.transpose(K_nm, 0, 1) # (p,N)
+        K_np = self.kernel(index_points, self.inducing_index_points) # (N,p)
+        K_pn = torch.transpose(K_np, 0, 1) # (p,N)
 
         # approximate the parameters for stochastic inducing points
-        sigma_l = K_pp + (self.N_train / b) * torch.matmul(K_mn, K_nm / phi_l[:,None])
+        sigma_l = K_pp + (self.N_train / b) * torch.matmul(K_pn, K_np / phi_l[:,None])
         sigma_l_inv = torch.linalg.inv(add_diagonal_jitter(sigma_l, self.jitter))
 
-        mu_hat = (self.N_train / b) * torch.matmul(torch.matmul(K_pp, torch.matmul(sigma_l_inv, K_mn)), w_l / phi_l)
+        mu_hat = (self.N_train / b) * torch.matmul(torch.matmul(K_pp, torch.matmul(sigma_l_inv, K_pn)), w_l / phi_l)
         A_hat = torch.matmul(K_pp, torch.matmul(sigma_l_inv, K_pp))
 
         # evaluate the posterior distribution of GP regression
-        mean_vector = torch.matmul(K_xp, torch.matmul(K_pp_inv, mu_hat)) 
-        K_xm_Sigma_l_K_mx = torch.matmul(K_xp, torch.matmul(sigma_l_inv, K_px))
-        B = K_xx + torch.diagonal(-torch.matmul(K_xp, torch.matmul(K_pp_inv, K_px)) + K_xm_Sigma_l_K_mx)
+        mean_vector = (self.N_train / b) * torch.matmul(K_xp, torch.matmul(sigma_l_inv, torch.matmul(K_pn, w_l / phi_l))) 
+        K_xp_Sigma_l_K_px = torch.matmul(K_xp, torch.matmul(sigma_l_inv, K_px))
+        B = K_xx + torch.diagonal(-torch.matmul(K_xp, torch.matmul(K_pp_inv, K_px)) + K_xp_Sigma_l_K_px)
 
         return mean_vector, B, mu_hat, A_hat
 
@@ -179,7 +178,7 @@ class spaVAE(nn.Module):
 
         for l in range(self.latent_GP_dim):
             g_p_m_l, g_p_v_l, mu_hat_l, A_hat_l = self.approximate_posterior(x, gp_mu[:, l], gp_var[:, l])
-            inside_elbo_recon_l, inside_elbo_kl_l = self.cal_L_H(x, raw_y, size_factors, mu_hat_l, A_hat_l)
+            inside_elbo_recon_l, inside_elbo_kl_l = self.cal_L_H(x=x, y=gp_mu[:,l], noise=gp_var[:,l], mu_hat=mu_hat_l, A_hat=A_hat_l)
 
             inside_elbo_recon.append(inside_elbo_recon_l)
             inside_elbo_kl.append(inside_elbo_kl_l)
@@ -197,7 +196,7 @@ class spaVAE(nn.Module):
         gp_p_v = torch.stack(gp_p_v, dim=1)
 
         # cross entropy term
-        gp_ce_term = gauss_cross_entropy(gp_p_m, gp_p_v, gp_mu, gp_var)
+        gp_ce_term = gauss_cross_entropy(gp_p_m, gp_p_v, gp_mu, gp_var, device=self.device)
         gp_ce_term = torch.sum(gp_ce_term)
 
         # KL term of GP prior
@@ -237,23 +236,25 @@ class spaVAE(nn.Module):
             mean_samples, disp_samples, inside_elbo_recon, inside_elbo_kl, latent_samples
 
 
-    def train(self, pos, ncounts, raw_counts, size_factors, lr=0.001, weight_decay=0.001, batch_size=512, num_samples=1, 
-            train_size=0.95, maxiter=5000, patience=200, save_model=True, model_weights="model.pt", print_kernel_scale=True):
+    def train_model(self, pos, ncounts, raw_counts, size_factors, lr=0.001, weight_decay=0.001, batch_size=512, num_samples=1, 
+            train_ratio=0.95, maxiter=5000, patience=200):
         self.train()
 
         dataset = TensorDataset(torch.tensor(pos, dtype=self.dtype), torch.tensor(ncounts, dtype=self.dtype), 
                         torch.tensor(raw_counts, dtype=self.dtype), torch.tensor(size_factors, dtype=self.dtype))
         
-        train_dataset, val_dataset = random_split(dataset=dataset, lengths=[train_size, 1.-train_size])
-        val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, drop_last=False)
+        if train_ratio < 1:
+            train_dataset, val_dataset = random_split(dataset=dataset, lengths=[train_ratio, 1.-train_ratio])
+            val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, drop_last=False)
+        else:
+            train_dataset = dataset
 
-        if ncounts.shape[0] * train_size > batch_size:
+        if ncounts.shape[0] * train_ratio > batch_size:
             dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
         else:
             dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=False)
         
-        val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, drop_last=False)
-        early_stopping = EarlyStopping(patience=patience, modelfile=model_weights)
+        early_stopping = EarlyStopping(patience=patience, modelfile=self.checkpoints_path)
 
         optimizer = optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=lr, weight_decay=weight_decay)
 
@@ -275,7 +276,7 @@ class spaVAE(nn.Module):
                 sf_batch = sf_batch.to(self.device)
 
                 elbo, recon_loss, gp_KL_term, gaussian_KL_term, inside_elbo, gp_ce_term, p_m, p_v, qnet_mu, qnet_var, \
-                    mean_samples, disp_samples, inside_elbo_recon, inside_elbo_kl, latent_samples, noise_reg = \
+                    mean_samples, disp_samples, inside_elbo_recon, inside_elbo_kl, latent_samples= \
                     self.forward(x=x_batch, y=y_batch, raw_y=y_raw_batch, size_factors=sf_batch, num_samples=num_samples)
 
                 self.zero_grad()
@@ -304,32 +305,33 @@ class spaVAE(nn.Module):
             gaussian_KL_term_val = gaussian_KL_term_val/num
             noise_reg_val = noise_reg_val/num
 
-            print('Training epoch {}, ELBO:{:.8f}, NB loss:{:.8f}, GP KLD loss:{:.8f}, Gaussian KLD loss:{:.8f}, noise regularization:{:8f}'.format(epoch+1, elbo_val, recon_loss_val, gp_KL_term_val, gaussian_KL_term_val, noise_reg_val))
+            print("-"*100)
+            print('Training epoch {}, ELBO:{:.8f}, NB loss:{:.8f}, GP KLD loss:{:.8f}, Gaussian KLD loss:{:.8f}'.format(epoch+1, elbo_val, recon_loss_val, gp_KL_term_val, gaussian_KL_term_val))
             print('Current beta', self.beta)
-            if print_kernel_scale:
-                print('Current kernel scale', torch.clamp(F.softplus(self.svgp.kernel.scale), min=1e-10, max=1e4).data)
+            print('Current kernel scale', torch.clamp(F.softplus(self.kernel.scale), min=1e-10, max=1e4).data)
 
-            validate_elbo_val = 0
-            validate_num = 0
-            for _, (validate_x_batch, validate_y_batch, validate_y_raw_batch, validate_sf_batch) in enumerate(val_dataloader):
-                validate_x_batch = validate_x_batch.to(self.device)
-                validate_y_batch = validate_y_batch.to(self.device)
-                validate_y_raw_batch = validate_y_raw_batch.to(self.device)
-                validate_sf_batch = validate_sf_batch.to(self.device)
+            if train_ratio < 1:
+                validate_elbo_val = 0
+                validate_num = 0
+                for _, (validate_x_batch, validate_y_batch, validate_y_raw_batch, validate_sf_batch) in enumerate(val_dataloader):
+                    validate_x_batch = validate_x_batch.to(self.device)
+                    validate_y_batch = validate_y_batch.to(self.device)
+                    validate_y_raw_batch = validate_y_raw_batch.to(self.device)
+                    validate_sf_batch = validate_sf_batch.to(self.device)
 
-                validate_elbo, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ = \
-                    self.forward(x=validate_x_batch, y=validate_y_batch, raw_y=validate_y_raw_batch, size_factors=validate_sf_batch, num_samples=num_samples)
+                    validate_elbo, _, _, _, _, _, _, _, _, _, _, _, _, _, _= \
+                        self.forward(x=validate_x_batch, y=validate_y_batch, raw_y=validate_y_raw_batch, size_factors=validate_sf_batch, num_samples=num_samples)
 
-                validate_elbo_val += validate_elbo.item()
-                validate_num += validate_x_batch.shape[0]
+                    validate_elbo_val += validate_elbo.item()
+                    validate_num += validate_x_batch.shape[0]
 
-            validate_elbo_val = validate_elbo_val / validate_num
+                validate_elbo_val = validate_elbo_val / validate_num
 
-            print("Training epoch {}, validating ELBO:{:.8f}".format(epoch+1, validate_elbo_val))
-            early_stopping(validate_elbo_val, self)
-            if early_stopping.early_stop:
-                print('EarlyStopping: run {} iteration'.format(epoch+1))
-                break
+                print("Training epoch {}, validating ELBO:{:.8f}".format(epoch+1, validate_elbo_val))
+                early_stopping(validate_elbo_val, self)
+                if early_stopping.early_stop:
+                    print('EarlyStopping: run {} iteration'.format(epoch+1))
+                    break
 
     def sample_latent_embedding(self, X, Y, batch_size=512):
         self.eval()
@@ -355,7 +357,7 @@ class spaVAE(nn.Module):
 
             gp_p_m, gp_p_v = [], []
             for l in range(self.latent_GP_dim):
-                gp_p_m_l, gp_p_v_l, _, _ = self.approximate_posterior(xbatch, xbatch, gp_mu[:, l], gp_var[:, l])
+                gp_p_m_l, gp_p_v_l, _, _ = self.approximate_posterior(xbatch, gp_mu[:, l], gp_var[:, l])
                 gp_p_m.append(gp_p_m_l)
                 gp_p_v.append(gp_p_v_l)
 
