@@ -216,7 +216,6 @@ class spaVAE(nn.Module):
 
         return elbo, recon_loss, gp_KL_term, gaussian_KL_term
 
-
     def train_model(self, pos, ncounts, raw_counts, size_factors, lr=0.001, weight_decay=0.001, batch_size=512, train_ratio=0.95, maxiter=5000, patience=200):
         self.train()
 
