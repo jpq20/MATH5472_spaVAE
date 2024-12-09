@@ -4,13 +4,26 @@ import torch.nn.functional as F
 
 import numpy as np
 from math import exp
+import h5py
+import scanpy as sc
+from sklearn import preprocessing
+import pandas as pd
+from sklearn.cluster import KMeans
+from sklearn import metrics
+from sklearn.metrics import pairwise_distances
+import matplotlib.pyplot as plt
+import seaborn as sns
+import umap
+
 
 eps = 1e-10
 
+class exp_trans(nn.Module):
+    def __init__(self):
+        super(exp_trans, self).__init__()
 
-def add_diagonal_jitter(matrix, jitter=1e-8):
-    Eye = torch.eye(matrix.size(-1), device=matrix.device).expand(matrix.shape)
-    return matrix + jitter * Eye
+    def forward(self, x):
+        return torch.clamp(torch.exp(x), min=1e-5, max=1e6)
 
 
 class EarlyStopping:
@@ -146,36 +159,83 @@ def gauss_cross_entropy(mu1, var1, mu2, var2, device):
     KL = log(var2/var1) + (var1 + (mu1-mu2)**2/var2)*0.5 - 0.5
     """
     return (-0.5 * (torch.log(2*torch.tensor([torch.pi], device=device)) + torch.log(var2) + (var1 + mu1 ** 2 - 2 * mu1 * mu2 + mu2 ** 2) / var2))
-
-
-class exp_trans(nn.Module):
-    def __init__(self):
-        super(exp_trans, self).__init__()
-
-    def forward(self, x):
-        return torch.clamp(torch.exp(x), min=1e-5, max=1e6)
     
-def buildNetwork(layers, activation="relu", dropout=0., dtype=torch.float32, norm="batchnorm"):
+def build_network(layers, act="relu", dropout=0., norm="batchnorm"):
     net = []
     for i in range(1, len(layers)):
+        # linear
         net.append(nn.Linear(layers[i-1], layers[i]))
+        # norm
         if norm == "batchnorm":
             net.append(nn.BatchNorm1d(layers[i]))
         elif norm == "layernorm":
             net.append(nn.LayerNorm(layers[i]))
-        if activation=="relu":
+        # activation
+        if act=="relu":
             net.append(nn.ReLU())
-        elif activation=="sigmoid":
+        elif act=="sigmoid":
             net.append(nn.Sigmoid())
-        elif activation=="elu":
+        elif act=="elu":
             net.append(nn.ELU())
+        # dropout
         if dropout > 0:
             net.append(nn.Dropout(p=dropout))
     return nn.Sequential(*net)
 
-class MeanAct(nn.Module):
-    def __init__(self):
-        super(MeanAct, self).__init__()
+def load_data(data_file, loc_range, inducing_point_steps):
+    data = h5py.File(data_file, 'r')
+    Y = np.array(data['X']).astype('float64')
+    X = np.array(data['pos']).astype('float64')
+    data.close()
 
-    def forward(self, x):
-        return torch.clamp(torch.exp(x), min=1e-5, max=1e6)
+    # rescale coordinates
+    scaler = preprocessing.MinMaxScaler()
+    X = scaler.fit_transform(X) * loc_range # This value can be set larger if it isn't numerical stable during training.
+
+    # SCANPY to process
+    ann_data = sc.AnnData(Y, dtype="float64")
+    sc.pp.filter_genes(ann_data, min_counts=1)
+    sc.pp.filter_cells(ann_data, min_counts=1)
+
+    ann_data.raw = ann_data.copy()
+
+    sc.pp.normalize_per_cell(ann_data) # normalization
+
+    ann_data.obs['size_factors'] = ann_data.obs.n_counts / np.median(ann_data.obs.n_counts) # size factor in paper
+
+    # rescale
+    sc.pp.log1p(ann_data)
+    sc.pp.scale(ann_data)
+
+    inducing_points = np.mgrid[0:(1+eps):(1./inducing_point_steps), 0:(1+eps):(1./inducing_point_steps)].reshape(2, -1).T * loc_range
+    
+    return ann_data, X, inducing_points
+
+def add_diagonal_jitter(matrix, jitter=1e-8):
+    Eye = torch.eye(matrix.size(-1), device=matrix.device).expand(matrix.shape)
+    return matrix + jitter * Eye
+
+def refine(sample_id, pred, dis, shape="square"):
+    refined_pred=[]
+    pred=pd.DataFrame({"pred": pred}, index=sample_id)
+    dis_df=pd.DataFrame(dis, index=sample_id, columns=sample_id)
+    if shape=="hexagon":
+        num_nbs=6 
+    elif shape=="square":
+        num_nbs=4
+    else:
+        print("Shape not recongized, shape='hexagon' for Visium data, 'square' for ST data.")
+    for i in range(len(sample_id)):
+        index=sample_id[i]
+        dis_tmp=dis_df.loc[index, :].sort_values()
+        nbs=dis_tmp.iloc[0:(num_nbs+1)]
+        nbs_pred=pred.loc[nbs.index, "pred"]
+        self_pred=pred.loc[index, "pred"]
+        v_c=nbs_pred.value_counts()
+        if (v_c.loc[self_pred] >= num_nbs/2):
+            refined_pred.append(v_c.idxmax())
+        else:           
+            refined_pred.append(self_pred)
+        if (i+1) % 1000 == 0:
+            print("Processed", i+1, "lines")
+    return np.array(refined_pred)
