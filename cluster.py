@@ -1,7 +1,13 @@
 from utils import *
+import argparse
 
 
-model_name = 'sample_151673'
+parser = argparse.ArgumentParser()
+parser.add_argument('--model_name', default='sample_151672')
+args = parser.parse_args()
+
+
+model_name = args.model_name
 data_file = f'/home/pjiangag/main/my_spaVAE/datasets/{model_name}.h5'
 latent_file = f'/home/pjiangag/main/my_spaVAE/checkpoints/{model_name}_latent.txt'
 
